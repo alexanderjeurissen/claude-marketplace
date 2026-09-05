@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "alexanderjeurissen",
+  "description": "Personal Claude Code tooling: the workspace engine, cmux skills, and house style.",
+  "owner": { "name": "Alexander Jeurissen", "url": "https://github.com/alexanderjeurissen" },
+  "plugins": [
+    {
+      "name": "workspace",
+      "displayName": "Workspace engine",
+      "source": "./plugins/workspace",
+      "description": "Per-issue isolated worktrees for a submodule hub: the workspace engine on PATH, the four /workspace commands, and the read-only-traversal approval hook.",
+      "version": "1.0.0",
+      "category": "workflow",
+      "keywords": ["worktree", "submodules", "monorepo", "cmux"]
+    },
+    {
+      "name": "cmux",
+      "displayName": "cmux",
+      "source": "./plugins/cmux",
+      "description": "Skills for driving cmux — workspaces, panes and surfaces, settings, keyboard shortcuts, the browser surface, markdown preview, and diagnostics.",
+      "version": "1.0.0",
+      "category": "workflow",
+      "keywords": ["cmux", "terminal", "workspaces"]
+    },
+    {
+      "name": "house-style",
+      "displayName": "House style",
+      "source": "./plugins/house-style",
+      "description": "Conventions that should hold in every repo and every session, local or remote — starting with the Mermaid diagram style.",
+      "version": "1.0.0",
+      "category": "documentation",
+      "keywords": ["mermaid", "diagrams", "conventions"]
+    }
+  ]
+}

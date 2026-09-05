@@ -1,0 +1,8 @@
+{
+  "name": "house-style",
+  "displayName": "House style",
+  "description": "Conventions that should hold in every repo and every session, local or remote — starting with the Mermaid diagram style.",
+  "version": "1.0.0",
+  "author": { "name": "Alexander Jeurissen" },
+  "keywords": ["mermaid", "diagrams", "conventions"]
+}

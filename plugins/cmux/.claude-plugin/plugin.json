@@ -1,0 +1,8 @@
+{
+  "name": "cmux",
+  "displayName": "cmux",
+  "description": "Skills for driving cmux — workspaces, panes and surfaces, settings, keyboard shortcuts, the browser surface, markdown preview, and diagnostics.",
+  "version": "1.0.0",
+  "author": { "name": "Alexander Jeurissen" },
+  "keywords": ["cmux", "terminal", "workspaces"]
+}

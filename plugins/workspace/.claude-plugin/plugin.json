@@ -1,0 +1,8 @@
+{
+  "name": "workspace",
+  "displayName": "Workspace engine",
+  "description": "Per-issue isolated worktrees for a submodule hub: the workspace engine on PATH, the four /workspace commands, and the read-only-traversal approval hook.",
+  "version": "1.0.0",
+  "author": { "name": "Alexander Jeurissen" },
+  "keywords": ["worktree", "submodules", "monorepo", "cmux"]
+}

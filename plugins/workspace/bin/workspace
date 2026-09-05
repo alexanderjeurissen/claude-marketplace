@@ -1,0 +1,507 @@
+#!/usr/bin/env bash
+# workspace — git/fs engine for per-worktree, fully-isolated dev environments.
+#
+# Terms: the HUB is the top-level checkout (the stable integration view containing modules/
+#   and per-worktree environments under .claude/worktrees/). A WORKTREE is one isolated
+#   environment — a git worktree of the hub repo with a git worktree of each in-scope
+#   submodule nested under modules/<repo>, object stores shared (no re-clone). The HARNESS
+#   (Claude Desktop, `claude --worktree`, or this engine) makes the hub worktree; the engine
+#   fills in the submodule worktrees. The hub itself stays a clean integration vantage point.
+#
+# This is deterministic git/fs plumbing only. It does NOT talk to Linear or cmux, and it does
+#   NOT commit the hub repo — the slash commands orchestrate those. Progress/warnings → stderr;
+#   capturable results → stdout as `key=value` (bootstrap) or per-repo result lines (sync).
+#
+# Submodules are discovered from the hub's .gitmodules; the hub is resolved from the caller's
+#   cwd — nothing is hub-specific, so one engine drives every hub.
+#
+# Integration branch = the branch a submodule is on in the hub checkout (e.g. core→develop);
+#   nothing hardcoded. Divergence from origin/HEAD is warned about, not blocked.
+#
+# Usage:
+#   workspace bootstrap --repos <a,b> [--name <name>] [--branch <branch>]
+#       Materialize the in-scope submodule worktrees into the current (or --name'd) hub
+#       worktree, branch defaulting to the worktree name. Adopts a worktree the harness
+#       already made (Desktop / `claude --worktree`), or creates one if absent.
+#   workspace fill [--branch <branch>] <repo> [<repo> …]
+#       Materialize submodule worktrees on demand (from inside the worktree). Pass --branch to
+#       join work already on a named branch; without it the branch defaults to the worktree name.
+#   workspace sync [--name <name>]              merge each submodule's integration branch + push
+#   workspace teardown --name <name> [--check]  remove a worktree's submodule + hub worktrees
+#   workspace prune                             sweep dangling worktree registrations
+#   workspace update-modules [--repos <a,b>]    fast-forward hub-checkout submodules (caller pins)
+#   workspace integration-branch <repo>
+#   workspace dir [<name>]                      print the resolved worktree dir
+#   workspace list                              list hub worktrees
+#   workspace hub                               print the hub path
+#
+# --name accepts --issue/--task as aliases (back-compat). bootstrap/sync target the worktree
+#   you run them from when --name is omitted; teardown always needs --name (it's a hub-side op).
+
+set -euo pipefail
+
+# ── locate the TRUE hub (the top-level checkout / main worktree) ──────────────
+# This engine lives on PATH (this plugin's bin/, added by Claude Code) and is shared across
+# every worktree, NOT inside any one repo — so it can't self-anchor from its own location,
+# and nothing about the root is hardcoded. Resolve from the caller's cwd instead:
+#   1. honor an explicit $WORKSPACE_HUB (export to override; handy for tests);
+#   2. else climb out of any submodule to the top superproject, then take the parent of
+#      that repo's git COMMON dir. From a linked worktree this still lands on the main
+#      checkout (worktrees share the main .git); climbing first sidesteps the .git/modules
+#      trap that a bare --git-common-dir hits inside a submodule.
+# If neither yields a hub (run from outside any checkout), die with a clear message rather
+# than guessing a default.
+resolve_hub() {
+  local base sp common
+  base="$PWD"
+  while sp="$(git -C "$base" rev-parse --show-superproject-working-tree 2>/dev/null)" && [ -n "$sp" ]; do
+    base="$sp"
+  done
+  if common="$(git -C "$base" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+    dirname "$common"; return 0
+  fi
+  return 0   # print nothing → caller dies with a clear message
+}
+HUB="${WORKSPACE_HUB:-$(resolve_hub)}"
+[ -n "$HUB" ] || { printf 'workspace: error: cannot resolve the hub from %s — cd into a hub checkout or export $WORKSPACE_HUB\n' "$PWD" >&2; exit 1; }
+
+# All of this engine's git network ops go over SSH to the submodule remotes. Bound the SSH
+# connect (and a mid-transfer stall) so an unreachable remote — VPN down — fails fast instead of
+# hanging: git has no fetch/ls-remote timeout of its own, which would otherwise defeat the
+# callers' "proceed with local refs" fallbacks. Only caps the connect + idle time, never a
+# transfer that's making progress. Respects an existing GIT_SSH_COMMAND if the caller set one.
+: "${GIT_SSH_COMMAND:=ssh -o ConnectTimeout=8 -o BatchMode=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=2}"
+export GIT_SSH_COMMAND
+
+# Submodules are grouped under this dir, both in the main checkout and inside each worktree.
+# Repo identifiers (in --repos) stay bare names; this prefix locates them on disk. To flatten
+# back to the root, set MODULES_DIR="".
+MODULES_DIR="modules"
+
+# Per-worktree environments live under .claude/worktrees/<name> — Claude Code's default
+# worktree dir, shared with Desktop-app sessions and `claude --worktree`. The legacy location
+# was workspaces/<name>; both are resolved (see resolve_ws_dir) so pre-move worktrees keep
+# working and drain naturally.
+WT_DIR=".claude/worktrees"
+LEGACY_WT_DIR="workspaces"
+
+# Known submodules are DISCOVERED from the hub root's .gitmodules (repo id = path basename),
+# so the engine adapts to whatever hub it runs in, with zero hardcoding.
+# Override with $WORKSPACE_SUBMODULES (space-separated) if ever needed.
+discover_submodules() {
+  local gm="$HUB/.gitmodules" p
+  [ -f "$gm" ] || return 0
+  git config -f "$gm" --get-regexp '^submodule\..*\.path$' 2>/dev/null \
+    | awk '{print $2}' | while IFS= read -r p; do [ -n "$p" ] && basename "$p"; done
+}
+KNOWN_SUBMODULES="${WORKSPACE_SUBMODULES:-$(discover_submodules | tr '\n' ' ')}"
+KNOWN_SUBMODULES="${KNOWN_SUBMODULES% }"
+
+# Path to a submodule's checkout, given a base dir (the main root or a worktree dir).
+submodule_path() { if [ -n "$MODULES_DIR" ]; then printf '%s/%s/%s' "$1" "$MODULES_DIR" "$2"; else printf '%s/%s' "$1" "$2"; fi; }
+
+# ── output helpers (info/warn/die → stderr; emit → stdout) ────────────────────
+info() { printf '  %s\n' "$*" >&2; }
+warn() { printf 'workspace: warning: %s\n' "$*" >&2; }
+die()  { printf 'workspace: error: %s\n' "$*" >&2; exit 1; }
+emit() { printf '%s\n' "$*"; }
+
+is_known_submodule() {
+  case " $KNOWN_SUBMODULES " in *" $1 "*) return 0;; *) return 1;; esac
+}
+
+# Claude Code keys per-project memory/history by the absolute cwd path with '/' → '-'.
+path_to_project_key() { printf '%s' "$1" | sed 's#/#-#g'; }
+
+# Is there a git worktree (workspace or submodule) materialized at this path?
+worktree_present() { [ -e "$1/.git" ]; }
+
+# Resolve a named worktree's dir: prefer an existing worktree in either location (so a
+# Desktop-created or legacy worktree is adopted, never duplicated), else default to the
+# canonical .claude/worktrees/<name>.
+resolve_ws_dir() {
+  local name="$1"
+  if   worktree_present "$HUB/$WT_DIR/$name";        then printf '%s/%s/%s' "$HUB" "$WT_DIR" "$name"
+  elif worktree_present "$HUB/$LEGACY_WT_DIR/$name"; then printf '%s/%s/%s' "$HUB" "$LEGACY_WT_DIR" "$name"
+  else printf '%s/%s/%s' "$HUB" "$WT_DIR" "$name"; fi
+}
+
+# Name of the worktree the caller's cwd is inside (climbing out of any submodule to the
+# top-level hub worktree first), or empty if at the hub root / outside a worktree. Lets
+# bootstrap/sync target "the worktree I'm in" without an explicit --name.
+current_ws_name() {
+  local base sp top
+  base="$PWD"
+  while sp="$(git -C "$base" rev-parse --show-superproject-working-tree 2>/dev/null)" && [ -n "$sp" ]; do
+    base="$sp"
+  done
+  top="$(git -C "$base" rev-parse --show-toplevel 2>/dev/null)" || return 0
+  case "$top" in
+    "$HUB/$WT_DIR/"*|"$HUB/$LEGACY_WT_DIR/"*) basename "$top" ;;
+    *) : ;;
+  esac
+}
+
+# ── integration branch resolution ─────────────────────────────────────────────
+integration_branch() {
+  local repo="$1" rd br def
+  rd="$(submodule_path "$HUB" "$repo")"
+  [ -d "$rd" ] || die "unknown submodule path: $rd"
+  br="$(git -C "$rd" branch --show-current 2>/dev/null || true)"
+  def="$(git -C "$rd" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || true)"
+  if [ -z "$br" ]; then
+    [ -n "$def" ] || die "$repo is detached and origin/HEAD is unknown — cannot resolve integration branch"
+    warn "$repo is in detached HEAD; falling back to its default branch '$def'"
+    br="$def"
+  elif [ -n "$def" ] && [ "$br" != "$def" ]; then
+    warn "$repo is on '$br' but its default is '$def' — using '$br' as the integration base (move feature work into a worktree if this is stale work in the main checkout)"
+  fi
+  printf '%s' "$br"
+}
+
+# ── memory symlink (share canonical memory; history stays per-worktree) ───────
+setup_memory_symlink() {
+  local ws_dir="$1" projects_dir canonical_memory per_task_dir link
+  projects_dir="$HOME/.claude/projects"
+  canonical_memory="$projects_dir/$(path_to_project_key "$HUB")/memory"
+  per_task_dir="$projects_dir/$(path_to_project_key "$ws_dir")"
+  link="$per_task_dir/memory"
+  mkdir -p "$canonical_memory" "$per_task_dir"
+  if [ -L "$link" ]; then
+    info "memory: symlink already present"
+  elif [ -e "$link" ]; then
+    warn "memory: $link exists and is not a symlink — leaving as-is (history will be isolated but memory not shared)"
+  else
+    ln -s "$canonical_memory" "$link"
+    info "memory: linked $link → canonical (shared facts, isolated history)"
+  fi
+}
+
+# ── bootstrap (materialize in-scope submodule worktrees into a hub worktree) ──
+# Adopts the hub worktree the harness (Desktop / `claude --worktree`) already created, or
+# creates one if absent, then materializes a worktree of each in-scope submodule on a branch
+# defaulting to the worktree name (distinct per worktree → collision-free across sessions, so
+# multiple worktrees for the same issue "just work"). No issue-keying, no manifest, no
+# one-per-issue guard: worktrees are disposable; the branch is what's durable (pushed by sync).
+cmd_bootstrap() {
+  local name="" branch="" repos=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name|--issue|--task) name="$2"; shift 2;;
+      --branch) branch="$2"; shift 2;;
+      --repos)  repos="$2";  shift 2;;
+      *) die "bootstrap: unknown flag $1";;
+    esac
+  done
+  [ -n "$name" ] || name="$(current_ws_name)"
+  [ -n "$name" ]  || die "bootstrap: run inside a worktree (…/.claude/worktrees/<name>) or pass --name <name>"
+  [ -n "$repos" ] || die "bootstrap requires --repos (comma-separated; e.g. core,infrastructure)"
+
+  local ws_dir; ws_dir="$(resolve_ws_dir "$name")"
+  local -a repo_arr
+  IFS=',' read -ra repo_arr <<< "$repos"
+  local repo
+  for repo in "${repo_arr[@]}"; do
+    is_known_submodule "$repo" || die "bootstrap: '$repo' is not a known submodule ($KNOWN_SUBMODULES)"
+  done
+  branch="${branch:-$name}"
+
+  # 1. adopt-or-create the hub worktree (detached @ current hub HEAD — scaffolding only)
+  if worktree_present "$ws_dir"; then
+    info "adopting worktree at ${ws_dir#"$HUB"/}"
+  else
+    info "creating worktree at ${ws_dir#"$HUB"/} (detached)"
+    git -C "$HUB" worktree add --detach "$ws_dir" HEAD >/dev/null
+  fi
+
+  # 2. a worktree of each in-scope submodule, on the feature branch
+  for repo in "${repo_arr[@]}"; do
+    local repo_path target ib
+    repo_path="$(submodule_path "$HUB" "$repo")"
+    target="$(submodule_path "$ws_dir" "$repo")"
+    mkdir -p "$(dirname "$target")"   # ensure <ws_dir>/modules/ exists
+    ib="$(integration_branch "$repo")"
+    git -C "$repo_path" fetch origin "$ib" --quiet 2>/dev/null || warn "$repo: fetch origin/$ib failed/timed out (offline?) — proceeding with local refs"
+    if worktree_present "$target"; then
+      info "$repo: worktree already present"
+    elif git -C "$repo_path" show-ref --verify --quiet "refs/heads/$branch"; then
+      info "$repo: attaching existing local branch $branch"
+      # An existing local branch may already be checked out in another worktree, in which case
+      # `worktree add` fails ("already checked out at …"). Skip this repo with a clear
+      # diagnostic instead of aborting the loop under set -e — bootstrap is re-runnable.
+      if ! git -C "$repo_path" worktree add "$target" "$branch" >/dev/null 2>&1; then
+        warn "$repo: cannot attach branch '$branch' — it may already be checked out in another worktree (see: git -C \"$repo_path\" worktree list). Skipping $repo."
+        continue
+      fi
+    elif git -C "$repo_path" ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+      info "$repo: restoring branch $branch from origin (tracking)"
+      git -C "$repo_path" worktree add --track -b "$branch" "$target" "origin/$branch" >/dev/null
+    else
+      info "$repo: new branch $branch off origin/$ib"
+      git -C "$repo_path" worktree add -b "$branch" "$target" "origin/$ib" >/dev/null
+    fi
+
+    # Initialize the worktree's scaffolding (env files, symlinks, history files) if the repo
+    # ships a bin/worktree-init. The post-checkout hook is supposed to do this on
+    # `git worktree add` but doesn't fire reliably here — so invoke it directly. Idempotent
+    # and repo-guarded: only repos that ship bin/worktree-init get it.
+    if [ -x "$target/bin/worktree-init" ]; then
+      info "$repo: running bin/worktree-init (env files, symlinks)"
+      ( cd "$target" && bin/worktree-init >/dev/null ) || warn "$repo: bin/worktree-init failed (continuing)"
+    fi
+  done
+
+  # 3. share memory (facts shared; history stays per-worktree)
+  setup_memory_symlink "$ws_dir"
+
+  emit "workspace_dir=$ws_dir name=$name repos=$repos branch=$branch status=ready"
+}
+
+# ── sync (merge integration branch in, push; report conflicts) ────────────────
+cmd_sync() {
+  local name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name|--issue|--task) name="$2"; shift 2;;
+      *) die "sync: unknown flag $1";;
+    esac
+  done
+  [ -n "$name" ] || name="$(current_ws_name)"
+  [ -n "$name" ] || die "sync: run inside a worktree or pass --name <name>"
+  local ws_dir; ws_dir="$(resolve_ws_dir "$name")"
+  worktree_present "$ws_dir" || die "no worktree at $ws_dir"
+
+  local repo any=0 conflicts=0
+  for repo in $KNOWN_SUBMODULES; do
+    local rd
+    rd="$(submodule_path "$ws_dir" "$repo")"
+    worktree_present "$rd" || continue
+    any=1
+    local ib cur
+    ib="$(integration_branch "$repo")"
+    cur="$(git -C "$rd" branch --show-current 2>/dev/null || true)"
+    # Detached HEAD → empty $cur; the no-upstream push below would become the invalid
+    # `git push -u origin ""`. Bail early with a clear diagnostic instead.
+    if [ -z "$cur" ]; then
+      emit "ERROR $repo: detached HEAD in ${ws_dir#"$HUB"/}/$repo — checkout the feature branch before syncing"; conflicts=1; continue
+    fi
+    git -C "$rd" fetch origin "$ib" --quiet 2>/dev/null || { emit "ERROR $repo: fetch origin/$ib failed/timed out"; conflicts=1; continue; }
+    if git -C "$rd" merge --no-edit "origin/$ib" >/dev/null 2>&1; then
+      if git -C "$rd" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+        if git -C "$rd" push >/dev/null 2>&1; then
+          emit "OK $repo: merged origin/$ib into $cur, pushed"
+        else
+          emit "ERROR $repo: merged origin/$ib but push failed (resolve in ${ws_dir#"$HUB"/}/$repo)"; conflicts=1
+        fi
+      elif git -C "$rd" push -u origin "$cur" >/dev/null 2>&1; then
+        emit "OK $repo: merged origin/$ib into $cur, pushed (set upstream)"
+      else
+        emit "ERROR $repo: merged origin/$ib but initial push failed (resolve in ${ws_dir#"$HUB"/}/$repo)"; conflicts=1
+      fi
+    else
+      emit "CONFLICT $repo: merge of origin/$ib into $cur conflicts — resolve in ${ws_dir#"$HUB"/}/$repo, then re-run sync"
+      conflicts=1
+    fi
+  done
+  [ "$any" = 1 ] || die "no submodule worktrees found under $ws_dir"
+  return "$conflicts"
+}
+
+# ── update-modules (fast-forward main-checkout submodules; caller pins) ───────
+cmd_update_modules() {
+  local repos=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repos) repos="$2"; shift 2;;
+      *) die "update-modules: unknown flag $1";;
+    esac
+  done
+  local -a repo_arr
+  if [ -n "$repos" ]; then
+    IFS=',' read -ra repo_arr <<< "$repos"
+  else
+    read -ra repo_arr <<< "$KNOWN_SUBMODULES"
+  fi
+
+  local repo moved=""
+  for repo in "${repo_arr[@]}"; do
+    is_known_submodule "$repo" || die "update-modules: '$repo' is not a known submodule"
+    local rd ib before after
+    rd="$(submodule_path "$HUB" "$repo")"
+    ib="$(integration_branch "$repo")"
+    before="$(git -C "$rd" rev-parse --short HEAD)"
+    git -C "$rd" fetch origin "$ib" --quiet 2>/dev/null || { emit "ERROR $repo: fetch origin/$ib failed/timed out"; continue; }
+    if git -C "$rd" merge --ff-only "origin/$ib" >/dev/null 2>&1; then
+      after="$(git -C "$rd" rev-parse --short HEAD)"
+      if [ "$before" != "$after" ]; then
+        emit "MOVED $repo: $before → $after ($ib)"; moved="$moved $repo"
+      else
+        emit "OK $repo: already current ($ib @ $after)"
+      fi
+    else
+      emit "SKIP $repo: origin/$ib is not a fast-forward from $before (diverged or local commits on '$ib') — resolve manually"
+    fi
+  done
+  # tell the caller which gitlinks to stage+commit as pins
+  [ -n "$moved" ] && emit "PIN:${moved# }"
+  return 0
+}
+
+# ── teardown (remove a worktree's submodule + hub worktrees, then prune) ──────
+# A hub-side op: --name is required (you don't tear down the worktree you're standing in).
+# --check is a dry-run safety report of uncommitted + unpushed work; it changes nothing.
+cmd_teardown() {
+  local name="" check=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name|--issue|--task) name="$2"; shift 2;;
+      --check) check=1; shift;;
+      *) die "teardown: unknown flag $1";;
+    esac
+  done
+  [ -n "$name" ] || die "teardown requires --name <name> (run from the hub: cd \"\$(workspace hub)\")"
+  local ws_dir; ws_dir="$(resolve_ws_dir "$name")"
+
+  if [ "$check" = 1 ]; then
+    worktree_present "$ws_dir" || die "no worktree at $ws_dir (nothing to tear down)"
+    local repo any=0 dirty=0
+    for repo in $KNOWN_SUBMODULES; do
+      local rd
+      rd="$(submodule_path "$ws_dir" "$repo")"
+      worktree_present "$rd" || continue
+      any=1
+      local st unpushed cur no_upstream=0 ib
+      cur="$(git -C "$rd" branch --show-current 2>/dev/null || true)"
+      st="$(git -C "$rd" status --porcelain 2>/dev/null || true)"
+      if git -C "$rd" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+        unpushed="$(git -C "$rd" log --oneline '@{u}..' 2>/dev/null || true)"
+      else
+        # No upstream set yet ≠ dirty. Approximate "unpushed work" as commits unique to this
+        # branch vs its integration base, so a freshly-created branch with zero commits beyond
+        # base isn't flagged dirty (and blocked from teardown) merely for lacking an upstream.
+        no_upstream=1
+        ib="$(integration_branch "$repo")"
+        unpushed="$(git -C "$rd" log --oneline "origin/$ib.." 2>/dev/null || true)"
+      fi
+      [ -n "$st$unpushed" ] && dirty=1
+      emit "REPO $repo (branch ${cur:-detached})"
+      if [ -n "$st" ]; then emit "  uncommitted:"; emit "$st"; else emit "  uncommitted: none"; fi
+      if [ -n "$unpushed" ]; then
+        emit "  unpushed:"; emit "$unpushed"
+        [ "$no_upstream" = 1 ] && emit "  (no upstream set — run /workspace-sync $name to push)"
+      elif [ "$no_upstream" = 1 ]; then
+        emit "  unpushed: none (no upstream set yet; no commits beyond origin/${ib})"
+      else
+        emit "  unpushed: none"
+      fi
+    done
+    [ "$any" = 1 ] || emit "(no submodule worktrees under $ws_dir)"
+    if [ "$dirty" = 1 ]; then emit "check=dirty name=$name"; else emit "check=clean name=$name"; fi
+    return 0
+  fi
+
+  # Refuse to remove the worktree the caller is standing in — that yanks cwd out from under
+  # the session and breaks its PreToolUse hooks. Run teardown from the hub root instead.
+  if [ "$(current_ws_name)" = "$name" ]; then
+    die "teardown: refusing to remove '$name' from inside it — run from the hub root (cd \"\$(workspace hub)\")"
+  fi
+
+  local repo
+  for repo in $KNOWN_SUBMODULES; do
+    local target repo_path
+    target="$(submodule_path "$ws_dir" "$repo")"
+    repo_path="$(submodule_path "$HUB" "$repo")"
+    if worktree_present "$target"; then
+      info "removing $repo worktree"
+      git -C "$repo_path" worktree remove --force "$target" || warn "$repo: worktree remove failed for $target"
+    fi
+  done
+  if worktree_present "$ws_dir"; then
+    info "removing worktree $name"
+    git -C "$HUB" worktree remove --force "$ws_dir" || warn "worktree: remove failed for $ws_dir"
+  fi
+  cmd_prune >/dev/null
+  # NOTE: deliberately leave the per-worktree memory symlink + history dir under
+  # ~/.claude/projects untouched (no rm under $HOME). The symlink points at the persistent
+  # canonical memory and is harmless.
+  emit "torn_down=$name status=removed"
+}
+
+# ── prune (sweep dangling worktree registrations, hub + each submodule) ───────
+# Safe by construction: `git worktree prune` only reaps entries whose working dir is missing,
+# so a live worktree (dir present) or a locked one is never touched. Run periodically, or
+# after archiving a Desktop session whose worktree was removed.
+cmd_prune() {
+  info "pruning dangling worktree registrations (hub + submodules)"
+  git -C "$HUB" worktree prune 2>/dev/null || true
+  local repo
+  for repo in $KNOWN_SUBMODULES; do
+    git -C "$(submodule_path "$HUB" "$repo")" worktree prune 2>/dev/null || true
+  done
+  emit "pruned=ok"
+}
+
+# ── list (all hub worktrees, both locations) ──────────────────────────────────
+cmd_list() {
+  git -C "$HUB" worktree list
+}
+
+# ── fill (materialize specific submodule worktrees on demand) ─────────────────
+# On-demand population: a worktree starts with empty modules/<repo> mountpoints; fill the ones
+# you need, when you need them. `bootstrap` scoped to the named repos, run from inside the
+# worktree (idempotent — already-present submodules are skipped). No upfront scope to declare.
+#
+# --branch matters when you're joining *existing* work: without it the branch defaults to the
+# worktree's directory name, which for a harness-generated worktree (`hi-9a8103`) matches nothing
+# on the remote — so fill falls through to cutting a fresh branch off origin/<integration> instead
+# of checking out the branch the work actually lives on.
+cmd_fill() {
+  local branch=""
+  local -a repos=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --branch) branch="$2"; shift 2;;
+      -*) die "fill: unknown flag $1";;
+      *) repos+=("$1"); shift;;
+    esac
+  done
+  [ ${#repos[@]} -ge 1 ] || die "fill requires one or more <repo> (e.g. workspace fill core infrastructure)"
+  local csv; csv="$(printf '%s,' "${repos[@]}")"; csv="${csv%,}"
+  if [ -n "$branch" ]; then
+    cmd_bootstrap --repos "$csv" --branch "$branch"
+  else
+    cmd_bootstrap --repos "$csv"
+  fi
+}
+
+# ── prepare (SessionStart helper: ready a worktree, print its name) ───────────
+# If the caller's cwd is inside a hub worktree, ensure the shared-memory symlink exists and
+# print the worktree name on stdout; otherwise print nothing. Cheap + idempotent — meant for a
+# SessionStart hook so a worktree session shares hub memory from turn 1.
+cmd_prepare() {
+  local name; name="$(current_ws_name)"
+  [ -n "$name" ] || return 0
+  setup_memory_symlink "$(resolve_ws_dir "$name")"
+  emit "$name"
+}
+
+# ── dispatch ──────────────────────────────────────────────────────────────────
+usage() { sed -n '2,39p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
+
+[ $# -gt 0 ] || usage
+cmd="$1"; shift
+case "$cmd" in
+  bootstrap)            cmd_bootstrap "$@";;
+  sync)                 cmd_sync "$@";;
+  update-modules)       cmd_update_modules "$@";;
+  teardown)             cmd_teardown "$@";;
+  prune)                cmd_prune "$@";;
+  fill)                 cmd_fill "$@";;
+  prepare)              cmd_prepare "$@";;
+  integration-branch)   [ $# -eq 1 ] || die "integration-branch requires exactly one <repo>"; integration_branch "$1"; printf '\n';;
+  dir|path)             [ $# -eq 1 ] || die "dir requires exactly one <name>"; resolve_ws_dir "$1"; printf '\n';;
+  hub|root)             emit "$HUB";;
+  list)                 cmd_list;;
+  -h|--help|help)       usage;;
+  *) die "unknown command: $cmd (expected: bootstrap|fill|sync|update-modules|teardown|prune|prepare|integration-branch|dir|hub|list)";;
+esac
