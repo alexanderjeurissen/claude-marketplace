@@ -20,22 +20,44 @@ claude plugin install house-style@alexanderjeurissen
 
 Then restart Claude Code. `claude plugin update <name>@alexanderjeurissen` picks up later changes.
 
-For a repo that should always carry the house style, commit it instead of installing by hand:
+For a repo that should always carry the house style, commit a `SessionStart` hook — **not**
+`enabledPlugins`:
 
 ```json
 {
-  "extraKnownMarketplaces": [
-    { "name": "alexanderjeurissen", "type": "github", "owner": "alexanderjeurissen", "repo": "claude-marketplace" }
-  ],
-  "enabledPlugins": { "house-style@alexanderjeurissen": true }
+  "hooks": {
+    "SessionStart": [
+      { "matcher": "startup|resume|clear|compact",
+        "hooks": [ { "type": "command", "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/install-house-style.sh\"", "timeout": 30 } ] }
+    ]
+  }
 }
 ```
 
-> **Unverified in remote sessions.** Repo-committed `enabledPlugins` did not install anything in a
-> Claude Code on the web session during testing, while the same marketplace was reachable over the
-> network. If that reproduces, a repo needs a `SessionStart` hook running
-> `claude plugin marketplace add …` and `claude plugin install -s local -y house-style@alexanderjeurissen`
-> instead. Settle this in one repo before rolling it out.
+```sh
+#!/usr/bin/env bash
+set -u
+command -v claude >/dev/null 2>&1 || exit 0
+claude plugin list 2>/dev/null | grep -q 'house-style@alexanderjeurissen' && exit 0
+claude plugin marketplace add alexanderjeurissen/claude-marketplace >/dev/null 2>&1
+claude plugin install house-style@alexanderjeurissen -s local -y >/dev/null 2>&1
+exit 0
+```
+
+Measured at 3.0s cold and 0.4s warm, idempotent, always exit 0.
+
+### Two things this cannot do
+
+**Repo-committed `extraKnownMarketplaces` + `enabledPlugins` installs nothing.** Tested in both the
+documented array form and the older object form, by running a real session in a project declaring
+them: the marketplace registry stayed empty while the same settings file's other keys were honoured.
+That is why the hook above exists.
+
+**A plugin is not available to the turn that installs it.** A session whose `SessionStart` hook
+installs the plugin answers "no" when asked for the skill; the next one answers "yes". It does
+arrive on a later turn of the same session. So the hook is fine for an ordinary multi-turn session
+and useless for a one-shot automated run — and anything that must be reliable on turn one belongs in
+the repo's own `.claude/skills/` instead, committed.
 
 ## Why a marketplace and not dotfiles
 
